@@ -74,3 +74,87 @@ dag=DAG(
 	,end_date = dt.datetime(year=2024, month=1, day=5)	
 	)
 ```
+- 과거 전체 데이터를 가져오지 않고 증분 추출을 통해, 특정 기간에 대한 데이터만 가져올 수 있음
+- 증분 방식은 데이터 양을 크게 줄이기 때문에 효율적임
+- Airflow는 태스크가 실행되는 특정 간격을 정의할 수 있는 매개변수를 제공함
+    - execution_date: 스케줄 간격으로 실행되는 시작 시간을 나타내는 타임스탬프
+        - 사진 ex) 오늘이 2019-01-04인데, daily 배치가 도는 워크플로가 있으면, 그 워크플로의 execution_date는 2024-01-03임.
+    - next_execution_date: 스케줄 간격의 종료 시간
+
+![image](https://github.com/user-attachments/assets/b477b8f1-54a9-4c55-884c-f778b91ad081)
+
+- execution_date 매개변수는 축약 매개변수로 제공됨
+    - ds: YYYY-MM-DD
+    - ds_nodash: YYYYMMDD
+
+```python
+fetch_events = BashOperator(
+    task_id="fetch_events",
+    bash_command=(
+        "mkdir -p /data/events && "
+        "curl -o /data/events.json "
+        "http://events_api:5000/events?"
+        "start_date={{ds}}&" # execution_date를 따름.
+        "end_date={{next_ds}}" # next_execution_date를 따름.
+    ),
+    dag=dag,
+)
+
+```
+
+- 데이터 파티셔닝: 데이터 세트를 더 작고 관리하기 쉬운 조각으로 나누는 작업
+    - 태스크의 출력을 해당 실행 날짜의 이름이 적힌 파일에 기록하는 방법 등
+- Airflow의 시간 처리는 스케줄 간격에 따라 실행됨
+- **start_date ≠ execution_date**
+    - execution_date: DAG 예약 간격의 시작 표시
+- 태스크에서 previous_execution_date, next_execution_date 매개변수를 사용할 때, 주의할 점은 매개변수가 스케줄 간격 이후의 DAG 실행을 통해서만 정의된다는 것. 수동 실행할 경우에 매개변수 값이 정의되지 않음
+- 백필(backfill): Airflow의 과거의 시작 날짜부터 과거의 간격 정의가 된다는 속성을 이용하여 과거 데이터 세트를 로드하거나 분석하기 위해 DAG의 과거 시점을 지정해 실행하는 것.
+- 기본적으로 Airflow는 아직 실행되지 않은 과거 스케줄 간격을 예약하고 실행함. 과거 시작 날짜를 지정하고 해당 DAG를 활성화하면 현재 시간 이전에 과거 시작 이후의 스케줄 간격이 생성됨.
+    - DAG의 catchup 매개변수에 의해 제어되며, false로 설정해 비활성화 할 수 있음
+
+![image](https://github.com/user-attachments/assets/1764b17b-d099-4c8f-8874-61c6c0f510c1)
+
+
+- 백필은 코드를 변경한 후, 데이터를 다시 처리하는 데 사용할 수 있음
+- ex) 현재, 데이터를 count만 하는 python 함수를 생성하고 Airflow 스케줄을 실행해왔었는데, 데이터 값의 sum도 python 함수에 추가하여 백필(backfill)을 수행하면, 과거 데이터에 count와 sum을 한 값이 모두 생기게 된다.
+    - 백필 수행 전 지표: count
+    - 백필 수행 후 지표: count, sum
+- Airflow 태스크의 가장 중요한 두 속성인 **원자성, 멱등성**
+    - 원자성: 모든 것이 완료되거나 or 완료되지 않거나 하는 속성
+    - 멱등성: 여러 번 실행해도 동일한 결과르 반환해야하는 속성
+
+### Chapter4. Airflow 콘텍스트를 사용하여 태스크 템플릿 작업하기
+
+- Airflow에서 {{}} (이중 중괄호)는 Jinja 템플릿 문자열을 나타내는 것임
+- 템플릿 작성은 런타임 시에 값을 할당하기 위해서 활용함
+- 템플릿으로 사용될 수 있는 속성 리스트가 별도로 존재하고 이는 airflow 공식 문서에서 확인 가능함.
+- PythonOperator는 문자열 인수 대신 함수를 사용하므로 Jinja 템플릿을 작업을 할 수 없음
+- PythonOperator는 콜러블 함수(Callable)에서 추가 인수를 제공하는 방법도 지원함
+    - ex) output_path를 입력 가능하게 만들어 작업에 따라 출력 경로를 변경하기 위해 전체 함수를 복사하는 대신, output_path만 별도로 구성 가능함
+    
+    ```python
+    def _get_data(output_path, **context):
+    	year, month, day, hour, *_ = context[execution_date].timetuple()
+    	url = {
+    			"https://dumps.wikimedia.org/other/pageviews/"
+    			f"{year}/{year}-{month:0>2}/pageviews-{year}{month:0>2}{day:0>2}-{hour:0>2}0000.gz"
+    				}
+    	request.urlretrieve(url, output_path)
+    	
+    # method1
+    get_data = PythonOperator(
+    		 task_id = "get_data"
+    		,python_callable = _get_data
+    		,op_args = ["/tmp/wikipageviews.gz"] # _get_data("/tmp/wikipageviews.gz")와 같음
+    		,dag = dag
+    		)
+    		
+    # method2
+    get_data = PythonOperator(
+    		 task_id = "get_data"
+    		,python_callable = _get_data
+    		,op_kwargs = ["output_path": "/tmp/wikipageviews.gz"] # _get_data("/tmp/wikipageviews.gz")와 같음
+    		,dag = dag
+    		)
+    
+    ```
